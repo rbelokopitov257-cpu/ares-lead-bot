@@ -192,20 +192,42 @@ async def setpartner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Партнёр {ref} не найден")
 
 
+# ——— Мини HTTP сервер для Render (бесплатный Web Service) ———
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        stats = getStats()
+        self.wfile.write(f"ARES Lead Bot OK | Leads: {stats['total_sent']}".encode())
+    def log_message(self, format, *args):
+        pass  # тихий лог
+
+def getStats():
+    db = load_db()
+    return {"total_sent": len(db.get("leads", []))}
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+
 # ——— Запуск ———
 def main():
+    # Запустить HTTP сервер в отдельном потоке (для Render health check)
+    threading.Thread(target=start_health_server, daemon=True).start()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("setpartner", setpartner))
 
-    print("[BOT] ARES Lead Bot zapuschen!")
-    print("[LINK] Ssylka dlya Alexeya: t.me/ares_automation_bot?start=alexey")
-    print("[LINK] Pryamaya ssylka: t.me/ares_automation_bot")
-    print("[CMD] Statistika: /stats")
-    print("[CMD] Privyazat partnera: /setpartner alexey <chat_id>")
-
+    print("[BOT] ARES Lead Bot running")
     app.run_polling()
 
 
