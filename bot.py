@@ -217,10 +217,7 @@ def start_health_server():
 
 
 # ——— Запуск ———
-def main():
-    # Запустить HTTP сервер в отдельном потоке (для Render health check)
-    threading.Thread(target=start_health_server, daemon=True).start()
-
+async def run_bot():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -228,7 +225,22 @@ def main():
     app.add_handler(CommandHandler("setpartner", setpartner))
 
     print("[BOT] ARES Lead Bot running")
-    app.run_polling()
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    # Держим бота живым
+    while True:
+        await asyncio.sleep(3600)
+
+
+def main():
+    # HTTP сервер для Render health check
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    # Запуск бота
+    asyncio.run(run_bot())
 
 
 if __name__ == "__main__":
