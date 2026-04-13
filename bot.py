@@ -71,25 +71,12 @@ def get_total_leads():
 # ——— /start ———
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-
-    # Игнорируем себя
-    if user.id in IGNORE_IDS:
-        return
-
     args = context.args
     source = "direct"
     if args and args[0] in PARTNERS:
         source = args[0]
 
-    is_new = add_lead(
-        user_id=user.id,
-        username=user.username or "",
-        first_name=user.first_name or "",
-        last_name=user.last_name or "",
-        source=source,
-    )
-
-    # Приветствие
+    # Приветствие — всегда
     welcome = (
         f"Здравствуйте, {user.first_name}! 👋\n\n"
         f"Вы попали в <b>ARES — автоматизация бизнеса</b>.\n\n"
@@ -102,6 +89,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📩 Наш специалист свяжется с вами в ближайшее время!"
     )
     await update.message.reply_html(welcome)
+
+    # Себя не считаем лидом
+    if user.id in IGNORE_IDS:
+        return
+
+    is_new = add_lead(
+        user_id=user.id,
+        username=user.username or "",
+        first_name=user.first_name or "",
+        last_name=user.last_name or "",
+        source=source,
+    )
 
     if not is_new:
         return  # Дубликат — не уведомляем повторно
