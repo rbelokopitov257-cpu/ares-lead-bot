@@ -15,13 +15,13 @@ BOT_TOKEN = "8798495636:AAFHIs934Kg2LwocusYRD4XwcaQtNpzbiwM"
 OWNER_CHAT_ID = 8516176669
 
 # ID которые НЕ считаются лидами (ты сам)
-IGNORE_IDS = {8516176669}
+IGNORE_IDS = {8516176669, 683536710}
 
 # Партнёры
 PARTNERS = {
     "alexey": {
         "name": "Алексей",
-        "chat_id": None,
+        "chat_id": 683536710,
         "notify": True,
     },
 }
