@@ -5,10 +5,18 @@ ARES Lead Bot — приём лидов от партнёров через ре�
 import os
 import json
 import asyncio
+import logging
+import traceback
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("ares-lead-bot")
 
 # ——— Конфиг ———
 BOT_TOKEN = "8798495636:AAFHIs934Kg2LwocusYRD4XwcaQtNpzbiwM"
@@ -184,10 +192,17 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         total = get_total_leads()
         self.wfile.write(f"OK | Leads: {total}".encode())
+
+    def do_HEAD(self):
+        # UptimeRobot Free шлёт HEAD — без этого метод не реализован,
+        # BaseHTTPRequestHandler возвращает 501, монитор показывает Down.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
 
     def log_message(self, format, *args):
         pass
@@ -199,22 +214,104 @@ def start_health_server():
 
 
 # ——— Запуск ———
-async def run_bot():
+async def _notify_owner_safe(app, text: str):
+    """Послать алерт владельцу, не сломаться если Telegram недоступен."""
+    try:
+        await app.bot.send_message(
+            chat_id=OWNER_CHAT_ID, text=text, parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"notify owner failed: {e}")
+
+
+async def run_bot_once():
+    """Один полноценный жизненный цикл бота: init → polling → блокирующий sleep.
+    Если что-то ломается — exception летит наружу, supervisor перезапустит.
+    """
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("setpartner", setpartner))
-    print("[BOT] ARES Lead Bot running")
+
+    logger.info("ARES Lead Bot starting (init + polling)")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
+    logger.info("ARES Lead Bot is live, polling Telegram")
+
+    # Сообщаем владельцу что бот ожил (полезно после крэшей).
+    await _notify_owner_safe(
+        app,
+        f"✅ <b>ARES Lead Bot online</b>\n"
+        f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
+        f"📊 Лидов в базе: {get_total_leads()}"
+    )
+
+    try:
+        # Долгий sleep — event loop держится, polling работает в фоне.
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        # Корректное закрытие: stop polling → stop app → shutdown.
+        try:
+            await app.updater.stop()
+        except Exception:
+            pass
+        try:
+            await app.stop()
+        except Exception:
+            pass
+        try:
+            await app.shutdown()
+        except Exception:
+            pass
+
+
+async def run_bot_forever():
+    """Supervisor: если run_bot_once падает — рестартим с backoff.
+    Без этого один сетевой сбой укладывал процесс на дни (free Render
+    не рестартит web-service от внутренних exception, только от exit code).
+    """
+    backoff = 5
+    crash_count = 0
     while True:
-        await asyncio.sleep(3600)
+        try:
+            await run_bot_once()
+            # Если run_bot_once вернулся без ошибки — это странно,
+            # но перезапустимся аккуратно.
+            logger.warning("run_bot_once returned cleanly, restarting")
+            backoff = 5
+        except Exception as e:
+            crash_count += 1
+            tb = traceback.format_exc()
+            logger.error(
+                f"run_bot_once crashed (#{crash_count}): {e}\n{tb}"
+            )
+            # Пытаемся пингнуть владельцу через прямой Bot, без app.
+            try:
+                from telegram import Bot
+                bot = Bot(BOT_TOKEN)
+                await bot.send_message(
+                    chat_id=OWNER_CHAT_ID,
+                    text=(
+                        f"⚠️ <b>Lead Bot crash #{crash_count}</b>\n"
+                        f"<code>{str(e)[:300]}</code>\n"
+                        f"Перезапуск через {backoff}s"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as ne:
+                logger.error(f"crash-notify failed: {ne}")
+
+        await asyncio.sleep(backoff)
+        # Экспоненциальный бэкофф до 5 минут — на случай длительного
+        # сетевого сбоя или token-проблемы.
+        backoff = min(backoff * 2, 300)
 
 
 def main():
     threading.Thread(target=start_health_server, daemon=True).start()
-    asyncio.run(run_bot())
+    asyncio.run(run_bot_forever())
 
 
 if __name__ == "__main__":
