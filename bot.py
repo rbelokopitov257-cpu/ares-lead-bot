@@ -3,10 +3,13 @@ ARES Lead Bot — приём лидов от партнёров через ре�
 Ссылка для Алексея: t.me/ares_automation_bot?start=alexey
 """
 import os
+import sys
 import json
+import time
 import asyncio
 import logging
 import traceback
+import threading
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -17,6 +20,16 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("ares-lead-bot")
+
+# ─── Heartbeat ───────────────────────────────────────────────────────────
+# Каждый успешный пинг Telegram API из event loop'а обновляет timestamp.
+# Sync-поток-watchdog проверяет его раз в 30 сек и убивает процесс если
+# heartbeat не обновлялся > HEARTBEAT_DEAD_THRESHOLD. Render видит exit
+# code 1, перезапускает контейнер — это работает даже когда asyncio
+# полностью завис и supervisor try/except внутри loop не срабатывает.
+_last_heartbeat = time.time()
+HEARTBEAT_INTERVAL = 30          # как часто пингаем Telegram изнутри loop'а
+HEARTBEAT_DEAD_THRESHOLD = 180   # 3 минуты без обновления = процесс мёртв
 
 # ——— Конфиг ———
 BOT_TOKEN = "8798495636:AAFHIs934Kg2LwocusYRD4XwcaQtNpzbiwM"
@@ -185,21 +198,55 @@ async def setpartner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ——— HTTP для Render ———
-import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        # /healthz — строгая проверка: 200 если polling жив (heartbeat
+        # свежий), 503 если бот тихо завис. Полезно если поставишь второй
+        # UptimeRobot monitor на /healthz.
+        # / (или любой другой path) — keep-alive: всегда 200 чтобы Render
+        # не уснул, даже если бот в перезапуске.
+        path = self.path.split("?")[0]
+        if path == "/healthz":
+            age = time.time() - _last_heartbeat
+            if age > HEARTBEAT_DEAD_THRESHOLD:
+                self.send_response(503)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(
+                    f"DEAD | heartbeat age {int(age)}s".encode()
+                )
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(f"OK | heartbeat age {int(age)}s".encode())
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         total = get_total_leads()
-        self.wfile.write(f"OK | Leads: {total}".encode())
+        age = int(time.time() - _last_heartbeat)
+        self.wfile.write(
+            f"OK | Leads: {total} | heartbeat age {age}s".encode()
+        )
 
     def do_HEAD(self):
         # UptimeRobot Free шлёт HEAD — без этого метод не реализован,
         # BaseHTTPRequestHandler возвращает 501, монитор показывает Down.
+        # Для HEAD на /healthz отвечаем 503 при мёртвом heartbeat,
+        # для всего остального — всегда 200 (keep-alive).
+        path = self.path.split("?")[0]
+        if path == "/healthz":
+            age = time.time() - _last_heartbeat
+            code = 503 if age > HEARTBEAT_DEAD_THRESHOLD else 200
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -213,6 +260,23 @@ def start_health_server():
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 
+def watchdog_loop():
+    """Sync-поток. Раз в 30 сек проверяет heartbeat. Если процесс тихо
+    завис (event loop стоит, async-supervisor не сработал) — kill процесс
+    через os._exit, Render рестартит контейнер от non-zero exit code."""
+    while True:
+        time.sleep(30)
+        age = time.time() - _last_heartbeat
+        if age > HEARTBEAT_DEAD_THRESHOLD:
+            logger.error(
+                f"WATCHDOG: heartbeat dead {int(age)}s > "
+                f"{HEARTBEAT_DEAD_THRESHOLD}s — exiting for restart"
+            )
+            # Не пытаемся графично закрывать — async-loop уже не отвечает.
+            # Render увидит exit code 1, перезапустит контейнер.
+            os._exit(1)
+
+
 # ——— Запуск ———
 async def _notify_owner_safe(app, text: str):
     """Послать алерт владельцу, не сломаться если Telegram недоступен."""
@@ -224,10 +288,37 @@ async def _notify_owner_safe(app, text: str):
         logger.error(f"notify owner failed: {e}")
 
 
+async def heartbeat_task(app):
+    """Каждые HEARTBEAT_INTERVAL сек дёргаем Telegram API (get_me — самый
+    дешёвый вызов). Если успех — обновляем глобальный timestamp. Это
+    одновременно:
+    1) проверка что polling/event-loop жив,
+    2) сигнал watchdog'у что всё ок,
+    3) keep-alive связи с Telegram.
+    Если 3 раза подряд get_me падает с одной ошибкой — raise: supervisor
+    подхватит, рестарт. Watchdog тоже сработает если loop полностью замёр."""
+    global _last_heartbeat
+    fail_streak = 0
+    while True:
+        try:
+            await app.bot.get_me()
+            _last_heartbeat = time.time()
+            fail_streak = 0
+        except Exception as e:
+            fail_streak += 1
+            logger.warning(f"heartbeat get_me failed (#{fail_streak}): {e}")
+            if fail_streak >= 3:
+                raise RuntimeError(
+                    f"heartbeat dead: get_me failed 3x in a row: {e}"
+                )
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
 async def run_bot_once():
-    """Один полноценный жизненный цикл бота: init → polling → блокирующий sleep.
+    """Один полноценный жизненный цикл бота: init → polling → heartbeat.
     Если что-то ломается — exception летит наружу, supervisor перезапустит.
     """
+    global _last_heartbeat
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
@@ -237,6 +328,7 @@ async def run_bot_once():
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
+    _last_heartbeat = time.time()  # сразу после успешного start_polling
     logger.info("ARES Lead Bot is live, polling Telegram")
 
     # Сообщаем владельцу что бот ожил (полезно после крэшей).
@@ -248,9 +340,10 @@ async def run_bot_once():
     )
 
     try:
-        # Долгий sleep — event loop держится, polling работает в фоне.
-        while True:
-            await asyncio.sleep(3600)
+        # Запускаем heartbeat — он будет жить пока polling жив.
+        # Если heartbeat сам raise (3 фейла get_me) — выходим из loop'а,
+        # supervisor рестартит. Если heartbeat ОК — wait(...) висит здесь.
+        await heartbeat_task(app)
     finally:
         # Корректное закрытие: stop polling → stop app → shutdown.
         try:
@@ -310,7 +403,11 @@ async def run_bot_forever():
 
 
 def main():
+    # 1. HTTP-сервер для Render keep-alive + UptimeRobot.
     threading.Thread(target=start_health_server, daemon=True).start()
+    # 2. Watchdog — kill процесса если event loop полностью завис.
+    threading.Thread(target=watchdog_loop, daemon=True).start()
+    # 3. Основной supervisor с polling.
     asyncio.run(run_bot_forever())
 
 
