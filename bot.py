@@ -11,7 +11,7 @@ import logging
 import traceback
 import threading
 from datetime import datetime
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 from pathlib import Path
 
@@ -97,19 +97,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args and args[0] in PARTNERS:
         source = args[0]
 
-    # Приветствие — всегда
-    welcome = (
-        f"Здравствуйте, {user.first_name}! 👋\n\n"
-        f"Вы попали в <b>ARES — автоматизация бизнеса</b>.\n\n"
-        f"Мы помогаем клиникам, салонам, автосервисам и другим бизнесам "
-        f"автоматизировать приём звонков и запись клиентов.\n\n"
-        f"✅ Голосовой ассистент принимает звонки 24/7\n"
-        f"✅ Записывает клиентов в расписание\n"
-        f"✅ Напоминает о визитах\n"
-        f"✅ Отправляет отчёт владельцу каждый вечер\n\n"
-        f"📩 Наш специалист свяжется с вами в ближайшее время!"
+    # Приветствие — всегда. Если рядом с bot.py лежит welcome.mp4,
+    # шлём его первым с подписью; иначе только текст. Кнопки —
+    # личный контакт + канал ARES.
+    welcome_text = (
+        f"<b>{user.first_name}, привет</b> 👋\n\n"
+        f"Сверху — короткое видео о нашей работе.\n\n"
+        f"С вами скоро свяжутся, чтобы уточнить "
+        f"детали и предложить решение под вас.\n\n"
+        f"<i>Спасибо за обращение.</i>"
     )
-    await update.message.reply_html(welcome)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "💬 Написать основателю",
+            url="https://t.me/ares4i",
+        )],
+        [InlineKeyboardButton(
+            "📰 Канал ARES",
+            url="https://t.me/aresautomation",
+        )],
+    ])
+
+    video_path = Path(__file__).parent / "welcome.mp4"
+    if video_path.exists():
+        with video_path.open("rb") as v:
+            await update.message.reply_video(
+                video=v,
+                caption=welcome_text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+    else:
+        await update.message.reply_html(
+            welcome_text, reply_markup=keyboard
+        )
 
     # Себя не считаем лидом
     if user.id in IGNORE_IDS:
