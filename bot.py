@@ -119,16 +119,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )],
     ])
 
+    # Шлём видео если есть. При любой ошибке (большой файл, network
+    # timeout, MOV-контейнер не принимается Telegram) — мягко падаем
+    # на текстовое приветствие, чтобы лид не остался с пустым /start.
     video_path = Path(__file__).parent / "welcome.mp4"
+    sent = False
     if video_path.exists():
-        with video_path.open("rb") as v:
-            await update.message.reply_video(
-                video=v,
-                caption=welcome_text,
-                reply_markup=keyboard,
-                parse_mode="HTML",
-            )
-    else:
+        try:
+            with video_path.open("rb") as v:
+                await update.message.reply_video(
+                    video=v,
+                    caption=welcome_text,
+                    reply_markup=keyboard,
+                    parse_mode="HTML",
+                    read_timeout=120,
+                    write_timeout=120,
+                )
+            sent = True
+        except Exception as e:
+            logger.warning(f"reply_video failed: {e!r}, falling back to text")
+
+    if not sent:
         await update.message.reply_html(
             welcome_text, reply_markup=keyboard
         )
